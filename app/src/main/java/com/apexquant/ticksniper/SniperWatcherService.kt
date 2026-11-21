@@ -28,7 +28,7 @@ class SniperWatcherService : Service() {
         createChannels()
         val notification = NotificationCompat.Builder(this, FG_CHANNEL)
             .setContentTitle("TickSniper Active")
-            .setContentText("Monitoring XAUUSD 1m candles in background...")
+            .setContentText("Monitoring 1m candles in background...")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setOngoing(true)
             .build()
@@ -41,17 +41,20 @@ class SniperWatcherService : Service() {
             while (isActive) {
                 try {
                     val prefs = getSharedPreferences("ticksniper_prefs", Context.MODE_PRIVATE)
-                    val setupsStr = prefs.getString("setups", "[]") ?: "[]"
-                    val setups = JSONArray(setupsStr)
+                    val symbol = prefs.getString("symbol", "XAUUSD") ?: "XAUUSD"
+                    val candles = if (symbol == "BTCUSD") fetch1mBtcCandles() else fetch1mGoldCandles()
 
-                    if (setups.length() > 0) {
-                        val candles = fetch1mGoldCandles()
-                        if (candles.size >= 10) {
-                            val currentPrice = candles.last().close
-                            prefs.edit().putString("last_price", String.format("%.2f", currentPrice)).apply()
+                    if (candles.size >= 10) {
+                        val currentPrice = candles.last().close
+                        prefs.edit().putString("last_price", String.format("%.2f", currentPrice)).apply()
 
+                        val setupsStr = prefs.getString("setups", "[]") ?: "[]"
+                        val setups = JSONArray(setupsStr)
+
+                        if (setups.length() > 0) {
                             val recentLow = candles.takeLast(3).minOf { it.low }
                             val recentHigh = candles.takeLast(3).maxOf { it.high }
+                            val tapBuffer = if (symbol == "BTCUSD") currentPrice * 0.0005 else 0.80
                             val updated = JSONArray()
 
                             for (i in 0 until setups.length()) {
@@ -63,21 +66,21 @@ class SniperWatcherService : Service() {
                                 var tapped = s.optBoolean("tapped", false)
 
                                 if ((dir == "BUY" && currentPrice < sl) || (dir == "SELL" && currentPrice > sl)) {
-                                    sendAlert("Setup Invalidated", "$dir @ $entry breached SL $sl before confirmation.", false)
+                                    sendAlert("Setup Invalidated", "$symbol $dir @ $entry breached SL $sl before confirmation.", false)
                                     continue
                                 }
 
                                 if (!tapped) {
-                                    if ((dir == "BUY" && recentLow <= entry + 0.80) || (dir == "SELL" && recentHigh >= entry - 0.80)) {
+                                    if ((dir == "BUY" && recentLow <= entry + tapBuffer) || (dir == "SELL" && recentHigh >= entry - tapBuffer)) {
                                         tapped = true
                                         s.put("tapped", true)
-                                        sendAlert("Zone Tapped!", "XAUUSD tapped $entry ($dir). Watching 1m close for CHoCH/rejection...", false)
+                                        sendAlert("Zone Tapped!", "$symbol tapped $entry ($dir). Watching 1m close for CHoCH/rejection...", false)
                                     }
                                 }
 
                                 if (tapped && check1mConfirmation(candles, dir)) {
                                     sendAlert(
-                                        "$dir XAUUSD CONFIRMED!",
+                                        "$dir $symbol CONFIRMED!",
                                         "Live: ${String.format("%.2f", currentPrice)} | Entry: $entry | SL: $sl | TP: $tp",
                                         true
                                     )
@@ -116,6 +119,26 @@ class SniperWatcherService : Service() {
             }
         }
         return list.takeLast(30)
+    }
+
+    private fun fetch1mBtcCandles(): List<Candle> {
+        val url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=30"
+        val req = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
+        val body = client.newCall(req).execute().body?.string() ?: return emptyList()
+        val arr = JSONArray(body)
+        val list = mutableListOf<Candle>()
+        for (i in 0 until arr.length()) {
+            val k = arr.getJSONArray(i)
+            list.add(
+                Candle(
+                    open = k.getString(1).toDouble(),
+                    high = k.getString(2).toDouble(),
+                    low = k.getString(3).toDouble(),
+                    close = k.getString(4).toDouble()
+                )
+            )
+        }
+        return list
     }
 
     private fun check1mConfirmation(candles: List<Candle>, dir: String): Boolean {
