@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Base64
+import android.view.View
 import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -30,6 +31,7 @@ class MainActivity : AppCompatActivity() {
     private val client = OkHttpClient()
     private var selectedBitmap: Bitmap? = null
 
+    private lateinit var symbolSpinner: Spinner
     private lateinit var apiKeyInput: EditText
     private lateinit var previewImage: ImageView
     private lateinit var statusText: TextView
@@ -65,9 +67,22 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "📈 TickSniper 1m XAUUSD"
+            text = "📈 TickSniper 1m AI Watcher"
             textSize = 22f
             setPadding(0, 0, 0, 20)
+        }
+
+        symbolSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, listOf("XAUUSD", "BTCUSD"))
+            setSelection(if (prefs.getString("symbol", "XAUUSD") == "BTCUSD") 1 else 0)
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
+                    val sym = if (pos == 1) "BTCUSD" else "XAUUSD"
+                    prefs.edit().putString("symbol", sym).putString("last_price", "Fetching...").apply()
+                    refreshWatchlist()
+                }
+                override fun onNothingSelected(parent: AdapterView<*>?) {}
+            }
         }
 
         apiKeyInput = EditText(this).apply {
@@ -159,6 +174,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         layout.addView(title)
+        layout.addView(symbolSpinner)
         layout.addView(apiKeyInput)
         layout.addView(saveKeyBtn)
         layout.addView(uploadBtn)
@@ -180,7 +196,7 @@ class MainActivity : AppCompatActivity() {
         scope.launch {
             while (isActive) {
                 refreshWatchlist()
-                delay(5000)
+                delay(4000)
             }
         }
     }
@@ -196,9 +212,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshWatchlist() {
         val prefs = getSharedPreferences("ticksniper_prefs", Context.MODE_PRIVATE)
+        val sym = prefs.getString("symbol", "XAUUSD") ?: "XAUUSD"
         val arr = JSONArray(prefs.getString("setups", "[]"))
         val price = prefs.getString("last_price", "Waiting...")
-        val sb = StringBuilder("Live Gold: $$price\nActive Watchlist (${arr.length()}):\n\n")
+        val sb = StringBuilder("Live $sym: $$price\nActive Watchlist (${arr.length()}):\n\n")
         for (i in 0 until arr.length()) {
             val s = arr.getJSONObject(i)
             val st = if (s.optBoolean("tapped")) "👀 Zone Tapped (Watching 1m Close)" else "⏳ Waiting for Zone Tap"
@@ -215,7 +232,7 @@ class MainActivity : AppCompatActivity() {
                 val b64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
 
                 val prompt = """
-                    Analyze this TradingView XAUUSD (Gold) chart screenshot.
+                    Analyze this TradingView chart screenshot.
                     If small Stop-Loss box is ABOVE large Take-Profit box -> SELL.
                     If small Stop-Loss box is BELOW large Take-Profit box -> BUY.
                     Return ONLY JSON: {"direction":"BUY","entry":3702.24,"sl":3699.57,"tp":3721.01}
@@ -233,26 +250,36 @@ class MainActivity : AppCompatActivity() {
                     }))
                 }
 
-             val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=$apiKey"
-                val req = Request.Builder()
-                    .url(url)
-                    .post(payload.toString().toRequestBody("application/json".toMediaType()))
-                    .build()
+                val models = listOf("gemini-3.8-flash", "gemini-3.0-flash", "gemini-2.5-flash")
+                var lastError = "Unknown Gemini Error"
+                var successText: String? = null
 
-                val resStr = client.newCall(req).execute().body?.string() ?: ""
-                val rootJson = JSONObject(resStr)
-                if (rootJson.has("error")) {
-                    val errMsg = rootJson.getJSONObject("error").optString("message", "Unknown Gemini API Error")
-                    throw Exception(errMsg)
+                for (model in models) {
+                    val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+                    val req = Request.Builder()
+                        .url(url)
+                        .post(payload.toString().toRequestBody("application/json".toMediaType()))
+                        .build()
+
+                    val resStr = client.newCall(req).execute().body?.string() ?: ""
+                    val rootJson = JSONObject(resStr)
+                    if (rootJson.has("error")) {
+                        lastError = rootJson.getJSONObject("error").optString("message", lastError)
+                        delay(1000)
+                        continue
+                    }
+
+                    successText = rootJson
+                        .getJSONArray("candidates").getJSONObject(0)
+                        .getJSONObject("content").getJSONArray("parts").getJSONObject(0)
+                        .getString("text")
+                        .replace("```json", "").replace("```", "").trim()
+                    break
                 }
 
-                val text = rootJson
-                    .getJSONArray("candidates").getJSONObject(0)
-                    .getJSONObject("content").getJSONArray("parts").getJSONObject(0)
-                    .getString("text")
-                    .replace("```json", "").replace("```", "").trim()
+                if (successText == null) throw Exception(lastError)
 
-                val parsed = JSONObject(text)
+                val parsed = JSONObject(successText)
                 withContext(Dispatchers.Main) {
                     dirSpinner.setSelection(if (parsed.getString("direction").uppercase() == "BUY") 0 else 1)
                     entryInput.setText(parsed.getDouble("entry").toString())
