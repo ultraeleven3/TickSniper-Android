@@ -176,7 +176,13 @@ class MainActivity : AppCompatActivity() {
         scroll.addView(layout)
         setContentView(scroll)
         startWatcherService()
-        refreshWatchlist()
+
+        scope.launch {
+            while (isActive) {
+                refreshWatchlist()
+                delay(5000)
+            }
+        }
     }
 
     private fun startWatcherService() {
@@ -191,68 +197,4 @@ class MainActivity : AppCompatActivity() {
     private fun refreshWatchlist() {
         val prefs = getSharedPreferences("ticksniper_prefs", Context.MODE_PRIVATE)
         val arr = JSONArray(prefs.getString("setups", "[]"))
-        val price = prefs.getString("last_price", "Waiting...")
-        val sb = StringBuilder("Live Gold: $$price\nActive Watchlist (${arr.length()}):\n\n")
-        for (i in 0 until arr.length()) {
-            val s = arr.getJSONObject(i)
-            val st = if (s.optBoolean("tapped")) "👀 Zone Tapped (Watching 1m Close)" else "⏳ Waiting for Zone Tap"
-            sb.append("#${i + 1} ${s.getString("direction")} @ ${s.getDouble("entry")} | SL: ${s.getDouble("sl")} | TP: ${s.getDouble("tp")}\n$st\n\n")
-        }
-        watchlistText.text = sb.toString()
-    }
-
-    private fun scanChartWithGemini(bmp: Bitmap, apiKey: String) {
-        scope.launch(Dispatchers.IO) {
-            try {
-                val out = ByteArrayOutputStream()
-                bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
-                val b64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
-
-                val prompt = """
-                    Analyze this TradingView XAUUSD (Gold) chart screenshot.
-                    If small Stop-Loss box is ABOVE large Take-Profit box -> SELL.
-                    If small Stop-Loss box is BELOW large Take-Profit box -> BUY.
-                    Return ONLY JSON: {"direction":"BUY","entry":3702.24,"sl":3699.57,"tp":3721.01}
-                """.trimIndent()
-
-                val payload = JSONObject().apply {
-                    put("contents", JSONArray().put(JSONObject().apply {
-                        put("parts", JSONArray()
-                            .put(JSONObject().put("text", prompt))
-                            .put(JSONObject().put("inline_data", JSONObject().apply {
-                                put("mime_type", "image/jpeg")
-                                put("data", b64)
-                            }))
-                        )
-                    }))
-                }
-
-                val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$apiKey"
-                val req = Request.Builder()
-                    .url(url)
-                    .post(payload.toString().toRequestBody("application/json".toMediaType()))
-                    .build()
-
-                val resStr = client.newCall(req).execute().body?.string() ?: ""
-                val text = JSONObject(resStr)
-                    .getJSONArray("candidates").getJSONObject(0)
-                    .getJSONObject("content").getJSONArray("parts").getJSONObject(0)
-                    .getString("text")
-                    .replace("```json", "").replace("```", "").trim()
-
-                val parsed = JSONObject(text)
-                withContext(Dispatchers.Main) {
-                    dirSpinner.setSelection(if (parsed.getString("direction").uppercase() == "BUY") 0 else 1)
-                    entryInput.setText(parsed.getDouble("entry").toString())
-                    slInput.setText(parsed.getDouble("sl").toString())
-                    tpInput.setText(parsed.getDouble("tp").toString())
-                    statusText.text = "✅ Levels extracted! Verify & tap Start Watcher."
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    statusText.text = "Scan error: ${e.message}"
-                }
-            }
-        }
-    }
-}
+        val price = prefs.getString("
