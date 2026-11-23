@@ -3,15 +3,21 @@ package com.apexquant.ticksniper
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
 import android.media.RingtoneManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -19,20 +25,30 @@ import kotlin.math.min
 class SniperWatcherService : Service() {
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private val client = OkHttpClient()
-    private val FG_CHANNEL = "ticksniper_bg"
-    private val ALERT_CHANNEL = "ticksniper_alerts"
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .build()
+
+    private val FG_CHANNEL = "pipsniper_bg_v2"
+    private val ALERT_CHANNEL = "pipsniper_alerts_v2"
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    data class Candle(
+        val timestamp: Long,
+        val open: Double,
+        val high: Double,
+        val low: Double,
+        val close: Double
+    )
 
     override fun onCreate() {
         super.onCreate()
         createChannels()
-        val notification = NotificationCompat.Builder(this, FG_CHANNEL)
-            .setContentTitle("TickSniper Active")
-            .setContentText("Monitoring 1m candles in background...")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setOngoing(true)
-            .build()
-        startForeground(101, notification)
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PipSniper::WatcherLock")
+
+        startForeground(101, buildForegroundNotification("Initializing live feed..."))
         startLoop()
     }
 
@@ -41,109 +57,164 @@ class SniperWatcherService : Service() {
             while (isActive) {
                 try {
                     val prefs = getSharedPreferences("ticksniper_prefs", Context.MODE_PRIVATE)
-                    val symbol = prefs.getString("symbol", "XAUUSD") ?: "XAUUSD"
-                    val candles = if (symbol == "BTCUSD") fetch1mBtcCandles() else fetch1mGoldCandles()
+                    val initialSetups = JSONArray(prefs.getString("setups", "[]") ?: "[]")
+
+                    if (initialSetups.length() == 0) {
+                        releaseWakeLock()
+                        updateForegroundNotification("Armed: 0 setups | Waiting for zones...")
+                        delay(15_000)
+                        continue
+                    }
+
+                    acquireWakeLock()
+
+                    // Determine symbol (supports BTC-USD if configured, defaults to GC=F)
+                    val symbol = prefs.getString("symbol", "GC=F") ?: "GC=F"
+                    val priceOffset = prefs.getFloat("price_offset", 0f).toDouble()
+                    val candles = fetch1mCandles(symbol, priceOffset)
 
                     if (candles.size >= 10) {
-                        val currentPrice = candles.last().close
-                        prefs.edit().putString("last_price", String.format("%.2f", currentPrice)).apply()
+                        val liveCandle = candles.last()
+                        val closedCandle = candles[candles.size - 2]
+                        val currentPrice = liveCandle.close
+                        val timeStr = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
 
-                        val setupsStr = prefs.getString("setups", "[]") ?: "[]"
-                        val setups = JSONArray(setupsStr)
+                        // Re-read prefs AFTER network call so we never overwrite newly added setups
+                        val freshSetups = JSONArray(prefs.getString("setups", "[]") ?: "[]")
+                        val updated = JSONArray()
+                        var nearestDist = Double.MAX_VALUE
 
-                        if (setups.length() > 0) {
-                            val recentLow = candles.takeLast(3).minOf { it.low }
-                            val recentHigh = candles.takeLast(3).maxOf { it.high }
-                            val tapBuffer = if (symbol == "BTCUSD") currentPrice * 0.0005 else 0.80
-                            val updated = JSONArray()
+                        for (i in 0 until freshSetups.length()) {
+                            val s = freshSetups.getJSONObject(i)
+                            val dir = s.getString("direction").uppercase(Locale.US)
+                            val entry = s.getDouble("entry")
+                            val sl = s.getDouble("sl")
+                            val tp = s.getDouble("tp")
+                            var tapped = s.optBoolean("tapped", false)
+                            var tapTimestamp = s.optLong("tap_ts", 0L)
 
-                            for (i in 0 until setups.length()) {
-                                val s = setups.getJSONObject(i)
-                                val dir = s.getString("direction")
-                                val entry = s.getDouble("entry")
-                                val sl = s.getDouble("sl")
-                                val tp = s.getDouble("tp")
-                                var tapped = s.optBoolean("tapped", false)
+                            nearestDist = min(nearestDist, abs(currentPrice - entry))
 
-                                if ((dir == "BUY" && currentPrice < sl) || (dir == "SELL" && currentPrice > sl)) {
-                                    sendAlert("Setup Invalidated", "$symbol $dir @ $entry breached SL $sl before confirmation.", false)
-                                    continue
+                            // 1. Check Invalidation (Stop Loss breached)
+                            if ((dir == "BUY" && currentPrice <= sl) || (dir == "SELL" && currentPrice >= sl)) {
+                                sendAlert(
+                                    "Setup Invalidated ($dir)",
+                                    "$dir @ $entry hit SL $sl before 1m confirmation.",
+                                    urgent = false
+                                )
+                                continue
+                            }
+
+                            // 2. Check Zone Tap (using recent 2 candles high/low + 0.80 buffer)
+                            val recentLow = min(liveCandle.low, closedCandle.low)
+                            val recentHigh = max(liveCandle.high, closedCandle.high)
+
+                            if (!tapped) {
+                                val hitZone = if (dir == "BUY") {
+                                    recentLow <= entry + 0.80 && currentPrice > sl
+                                } else {
+                                    recentHigh >= entry - 0.80 && currentPrice < sl
                                 }
 
-                                if (!tapped) {
-                                    if ((dir == "BUY" && recentLow <= entry + tapBuffer) || (dir == "SELL" && recentHigh >= entry - tapBuffer)) {
-                                        tapped = true
-                                        s.put("tapped", true)
-                                        sendAlert("Zone Tapped!", "$symbol tapped $entry ($dir). Watching 1m close for CHoCH/rejection...", false)
-                                    }
-                                }
+                                if (hitZone) {
+                                    tapped = true
+                                    // Record the exact candle timestamp where tap occurred
+                                    tapTimestamp = if (
+                                        (dir == "BUY" && closedCandle.low <= entry + 0.80) ||
+                                        (dir == "SELL" && closedCandle.high >= entry - 0.80)
+                                    ) closedCandle.timestamp else liveCandle.timestamp
 
-                                if (tapped && check1mConfirmation(candles, dir)) {
+                                    s.put("tapped", true)
+                                    s.put("tap_ts", tapTimestamp)
                                     sendAlert(
-                                        "$dir $symbol CONFIRMED!",
-                                        "Live: ${String.format("%.2f", currentPrice)} | Entry: $entry | SL: $sl | TP: $tp",
-                                        true
+                                        "Zone Tapped! ($dir)",
+                                        "Price tapped $entry. Waiting for 1m closed candle confirmation...",
+                                        urgent = false
+                                    )
+                                }
+                            }
+
+                            // 3. Check 1m Confirmation ONLY on a closed candle at/after the tap timestamp
+                            if (tapped && closedCandle.timestamp >= tapTimestamp) {
+                                if (check1mConfirmation(candles, dir)) {
+                                    sendAlert(
+                                        "$dir CONFIRMED!",
+                                        "Live: ${String.format(Locale.US, "%.2f", currentPrice)} | Entry: $entry | SL: $sl | TP: $tp",
+                                        urgent = true
                                     )
                                     continue
                                 }
-                                updated.put(s)
                             }
-                            prefs.edit().putString("setups", updated.toString()).apply()
+
+                            updated.put(s)
                         }
+
+                        prefs.edit()
+                            .putString("last_price", String.format(Locale.US, "%.2f", currentPrice))
+                            .putString("setups", updated.toString())
+                            .apply()
+
+                        val distLabel = if (nearestDist < Double.MAX_VALUE) {
+                            String.format(Locale.US, "%.2f", nearestDist)
+                        } else "--"
+
+                        updateForegroundNotification(
+                            "Live: ${String.format(Locale.US, "%.2f", currentPrice)} | Dist: $distLabel | Tick: $timeStr"
+                        )
+                    } else {
+                        updateForegroundNotification("Feed stalled — retrying Yahoo Finance...")
                     }
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    updateForegroundNotification("Network hiccup — retrying in 15s...")
                 }
                 delay(15_000)
             }
         }
     }
 
-    data class Candle(val open: Double, val high: Double, val low: Double, val close: Double)
+    private fun fetch1mCandles(symbol: String, offset: Double): List<Candle> {
+        val url = "https://query1.finance.yahoo.com/v8/finance/chart/$symbol?interval=1m&range=1d"
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", "Mozilla/5.0")
+            .build()
 
-    private fun fetch1mGoldCandles(): List<Candle> {
-        val url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=1d"
-        val req = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
-        val body = client.newCall(req).execute().body?.string() ?: return emptyList()
-        val json = JSONObject(body)
-        val result = json.getJSONObject("chart").getJSONArray("result").getJSONObject(0)
-        val quote = result.getJSONObject("indicators").getJSONArray("quote").getJSONObject(0)
-        val opens = quote.getJSONArray("open")
-        val highs = quote.getJSONArray("high")
-        val lows = quote.getJSONArray("low")
-        val closes = quote.getJSONArray("close")
+        client.newCall(req).execute().use { response ->
+            if (!response.isSuccessful) return emptyList()
+            val body = response.body?.string() ?: return emptyList()
 
-        val list = mutableListOf<Candle>()
-        for (i in 0 until closes.length()) {
-            if (!closes.isNull(i) && !opens.isNull(i)) {
-                list.add(Candle(opens.getDouble(i), highs.getDouble(i), lows.getDouble(i), closes.getDouble(i)))
+            val json = JSONObject(body)
+            val result = json.getJSONObject("chart").getJSONArray("result").getJSONObject(0)
+            val timestamps = result.getJSONArray("timestamp")
+            val quote = result.getJSONObject("indicators").getJSONArray("quote").getJSONObject(0)
+
+            val opens = quote.getJSONArray("open")
+            val highs = quote.getJSONArray("high")
+            val lows = quote.getJSONArray("low")
+            val closes = quote.getJSONArray("close")
+
+            val list = mutableListOf<Candle>()
+            for (i in 0 until closes.length()) {
+                if (!closes.isNull(i) && !opens.isNull(i) && !highs.isNull(i) && !lows.isNull(i)) {
+                    list.add(
+                        Candle(
+                            timestamp = timestamps.getLong(i),
+                            open = opens.getDouble(i) + offset,
+                            high = highs.getDouble(i) + offset,
+                            low = lows.getDouble(i) + offset,
+                            close = closes.getDouble(i) + offset
+                        )
+                    )
+                }
             }
+            return list.takeLast(30)
         }
-        return list.takeLast(30)
-    }
-
-    private fun fetch1mBtcCandles(): List<Candle> {
-        val url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=30"
-        val req = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
-        val body = client.newCall(req).execute().body?.string() ?: return emptyList()
-        val arr = JSONArray(body)
-        val list = mutableListOf<Candle>()
-        for (i in 0 until arr.length()) {
-            val k = arr.getJSONArray(i)
-            list.add(
-                Candle(
-                    open = k.getString(1).toDouble(),
-                    high = k.getString(2).toDouble(),
-                    low = k.getString(3).toDouble(),
-                    close = k.getString(4).toDouble()
-                )
-            )
-        }
-        return list
     }
 
     private fun check1mConfirmation(candles: List<Candle>, dir: String): Boolean {
-        val c1 = candles[candles.size - 2]
-        val c2 = candles[candles.size - 3]
+        if (candles.size < 7) return false
+        val c1 = candles[candles.size - 2] // Last CLOSED 1m candle
+        val c2 = candles[candles.size - 3] // Candle before c1
         val prevSlice = candles.subList(candles.size - 6, candles.size - 2)
         val recentHigh = prevSlice.maxOf { it.high }
         val recentLow = prevSlice.minOf { it.low }
@@ -163,6 +234,24 @@ class SniperWatcherService : Service() {
             val engulfing = c1.close < c1.open && c2.close > c2.open && c1.close < c2.open
             choch || pinbar || engulfing
         }
+    }
+
+    private fun buildForegroundNotification(statusText: String): Notification {
+        val intent = Intent(this, MainActivity::class.java)
+        val pi = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
+        return NotificationCompat.Builder(this, FG_CHANNEL)
+            .setContentTitle("Pip Sniper Active")
+            .setContentText(statusText)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentIntent(pi)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .build()
+    }
+
+    private fun updateForegroundNotification(statusText: String) {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(101, buildForegroundNotification(statusText))
     }
 
     private fun sendAlert(title: String, msg: String, urgent: Boolean) {
@@ -192,18 +281,45 @@ class SniperWatcherService : Service() {
     private fun createChannels() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            nm.createNotificationChannel(NotificationChannel(FG_CHANNEL, "Background Watcher", NotificationManager.IMPORTANCE_LOW))
-            val alertCh = NotificationChannel(ALERT_CHANNEL, "Trade Confirmations", NotificationManager.IMPORTANCE_HIGH).apply {
+            nm.createNotificationChannel(
+                NotificationChannel(FG_CHANNEL, "Pip Sniper Watcher", NotificationManager.IMPORTANCE_LOW)
+            )
+
+            val alarmUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+            val audioAttrs = AudioAttributes.Builder()
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .setUsage(AudioAttributes.USAGE_ALARM)
+                .build()
+
+            val alertCh = NotificationChannel(
+                ALERT_CHANNEL,
+                "Pip Sniper Trade Alerts",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
                 enableVibration(true)
                 vibrationPattern = longArrayOf(0, 500, 250, 500, 250, 800)
+                setSound(alarmUri, audioAttrs)
             }
             nm.createNotificationChannel(alertCh)
+        }
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == false) {
+            wakeLock?.acquire(60 * 60 * 1000L) // 1 hour max safety window, auto-renewed while active
+        }
+    }
+
+    private fun releaseWakeLock() {
+        if (wakeLock?.isHeld == true) {
+            wakeLock?.release()
         }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        releaseWakeLock()
         scope.cancel()
         super.onDestroy()
     }
