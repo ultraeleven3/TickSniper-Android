@@ -8,7 +8,7 @@ android {
     compileSdk 34
 
     defaultConfig {
-        applicationId "com.apexquant.ticksniper"
+       applicationId "com.apexquant.pipsniper"
         minSdk 26
         targetSdk 34
         versionCode 1
