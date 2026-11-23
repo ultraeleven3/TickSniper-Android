@@ -274,8 +274,13 @@ class MainActivity : AppCompatActivity() {
     private fun scanChartWithGemini(bmp: Bitmap, apiKey: String) {
         scope.launch(Dispatchers.IO) {
             try {
+                val scaledBmp = if (bmp.width > 1280) {
+                    val ratio = 1280.0 / bmp.width
+                    Bitmap.createScaledBitmap(bmp, 1280, (bmp.height * ratio).toInt(), true)
+                } else bmp
+
                 val out = ByteArrayOutputStream()
-                bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                scaledBmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
                 val b64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
 
                 val prompt = """
@@ -285,93 +290,102 @@ class MainActivity : AppCompatActivity() {
                     Return ONLY raw JSON with no markdown: {"direction":"BUY","entry":3702.24,"sl":3699.57,"tp":3721.01}
                 """.trimIndent()
 
-                val models = listOf("gemini-3.8-flash", "gemini-3.0-flash", "gemini-2.5-flash")
-                var lastError = "Unknown Gemini Error"
+                val models = listOf("gemini-3.8-flash", "gemini-3.0-flash")
+                var primaryError: String? = null
                 var successText: String? = null
 
-                // 1. Try Interactions API first (supports AQ.* keys and gemini-3.8-flash / 3.0-flash)
-                for (model in models) {
-                    val interactionsPayload = JSONObject().apply {
-                        put("model", model)
-                        put("input", JSONArray()
-                            .put(JSONObject().apply {
-                                put("type", "text")
-                                put("text", prompt)
-                            })
-                            .put(JSONObject().apply {
-                                put("type", "image")
-                                put("data", b64)
+                // 1. Standard generateContent endpoint (officially supported on gemini-3.8-flash)
+                val genPayload = JSONObject().apply {
+                    put("contents", JSONArray().put(JSONObject().apply {
+                        put("parts", JSONArray()
+                            .put(JSONObject().put("text", prompt))
+                            .put(JSONObject().put("inline_data", JSONObject().apply {
                                 put("mime_type", "image/jpeg")
-                            })
+                                put("data", b64)
+                            }))
                         )
-                    }
+                    }))
+                }
 
+                for (model in models) {
+                    val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
                     val req = Request.Builder()
-                        .url("https://generativelanguage.googleapis.com/v1beta/interactions")
-                        .header("x-goog-api-key", apiKey)
-                        .post(interactionsPayload.toString().toRequestBody("application/json".toMediaType()))
+                        .url(url)
+                        .post(genPayload.toString().toRequestBody("application/json".toMediaType()))
                         .build()
 
                     client.newCall(req).execute().use { resp ->
                         val resStr = resp.body?.string() ?: ""
                         val rootJson = JSONObject(resStr)
                         if (rootJson.has("error")) {
-                            lastError = rootJson.getJSONObject("error").optString("message", lastError)
+                            if (primaryError == null) {
+                                primaryError = "[$model] " + rootJson.getJSONObject("error").optString("message", resStr)
+                            }
                             return@use
                         }
-                        val outputs = rootJson.optJSONArray("outputs")
-                        if (outputs != null) {
-                            for (i in 0 until outputs.length()) {
-                                val item = outputs.getJSONObject(i)
-                                if (item.optString("type") == "text") {
-                                    successText = extractJsonBlock(item.getString("text"))
-                                    break
-                                }
+                        val parts = rootJson
+                            .getJSONArray("candidates").getJSONObject(0)
+                            .getJSONObject("content").getJSONArray("parts")
+                        for (i in 0 until parts.length()) {
+                            val p = parts.getJSONObject(i)
+                            if (p.has("text") && !p.optBoolean("thought", false)) {
+                                successText = extractJsonBlock(p.getString("text"))
+                                break
                             }
                         }
                     }
                     if (successText != null) break
                 }
 
-                // 2. Fallback to standard generateContent endpoint
+                // 2. Fallback to Interactions API (/v1beta/interactions)
                 if (successText == null) {
-                    val genPayload = JSONObject().apply {
-                        put("contents", JSONArray().put(JSONObject().apply {
-                            put("parts", JSONArray()
-                                .put(JSONObject().put("text", prompt))
-                                .put(JSONObject().put("inline_data", JSONObject().apply {
-                                    put("mime_type", "image/jpeg")
-                                    put("data", b64)
-                                }))
-                            )
-                        }))
-                    }
-
                     for (model in models) {
-                        val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+                        val interactionsPayload = JSONObject().apply {
+                            put("model", model)
+                            put("input", JSONArray()
+                                .put(JSONObject().apply {
+                                    put("type", "text")
+                                    put("text", prompt)
+                                })
+                                .put(JSONObject().apply {
+                                    put("type", "image")
+                                    put("data", b64)
+                                    put("mime_type", "image/jpeg")
+                                })
+                            )
+                        }
+
                         val req = Request.Builder()
-                            .url(url)
-                            .post(genPayload.toString().toRequestBody("application/json".toMediaType()))
+                            .url("https://generativelanguage.googleapis.com/v1beta/interactions")
+                            .header("x-goog-api-key", apiKey)
+                            .post(interactionsPayload.toString().toRequestBody("application/json".toMediaType()))
                             .build()
 
                         client.newCall(req).execute().use { resp ->
                             val resStr = resp.body?.string() ?: ""
                             val rootJson = JSONObject(resStr)
                             if (rootJson.has("error")) {
-                                lastError = rootJson.getJSONObject("error").optString("message", lastError)
+                                if (primaryError == null) {
+                                    primaryError = "[$model interactions] " + rootJson.getJSONObject("error").optString("message", resStr)
+                                }
                                 return@use
                             }
-                            val raw = rootJson
-                                .getJSONArray("candidates").getJSONObject(0)
-                                .getJSONObject("content").getJSONArray("parts").getJSONObject(0)
-                                .getString("text")
-                            successText = extractJsonBlock(raw)
+                            val outputs = rootJson.optJSONArray("outputs")
+                            if (outputs != null) {
+                                for (i in 0 until outputs.length()) {
+                                    val item = outputs.getJSONObject(i)
+                                    if (item.optString("type") == "text") {
+                                        successText = extractJsonBlock(item.getString("text"))
+                                        break
+                                    }
+                                }
+                            }
                         }
                         if (successText != null) break
                     }
                 }
 
-                if (successText == null) throw Exception(lastError)
+                if (successText == null) throw Exception(primaryError ?: "Empty response from Gemini")
 
                 val parsed = JSONObject(successText!!)
                 withContext(Dispatchers.Main) {
