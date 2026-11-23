@@ -290,7 +290,7 @@ class MainActivity : AppCompatActivity() {
                     Return ONLY raw JSON with no markdown: {"direction":"BUY","entry":3702.24,"sl":3699.57,"tp":3721.01}
                 """.trimIndent()
 
-                val models = listOf("gemini-3.8-flash", "gemini-3.0-flash")
+               val models = listOf("gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.8-flash")
                 var primaryError: String? = null
                 var successText: String? = null
 
