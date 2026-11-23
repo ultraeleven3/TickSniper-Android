@@ -16,10 +16,21 @@ android {
     }
 
     buildTypes {
+        debug {
+            resValue "string", "app_name", "Pip Sniper"
+        }
         release {
+            resValue "string", "app_name", "Pip Sniper"
             minifyEnabled false
         }
     }
+
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            outputFileName = "Pip-Sniper-${variant.name}.apk"
+        }
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
