@@ -9,15 +9,17 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.text.InputType
 import android.util.Base64
-import android.view.View
 import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import kotlinx.coroutines.*
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -25,364 +27,284 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
-import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 class MainActivity : AppCompatActivity() {
 
-    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .build()
+    private lateinit var etApiKey: EditText
+    private lateinit var btnPickImage: Button
+    private lateinit var btnScanChart: Button
+    private lateinit var ivPreview: ImageView
+    private lateinit var rgDirection: RadioGroup
+    private lateinit var rbBuy: RadioButton
+    private lateinit var rbSell: RadioButton
+    private lateinit var etEntry: EditText
+    private lateinit var etSl: EditText
+    private lateinit var etTp: EditText
+    private lateinit var spSymbol: Spinner
+    private lateinit var btnStartWatcher: Button
+    private lateinit var btnStopWatcher: Button
+    private lateinit var tvStatus: TextView
 
     private var selectedBitmap: Bitmap? = null
 
-    private lateinit var symbolSpinner: Spinner
-    private lateinit var apiKeyInput: EditText
-    private lateinit var previewImage: ImageView
-    private lateinit var statusText: TextView
-    private lateinit var dirSpinner: Spinner
-    private lateinit var entryInput: EditText
-    private lateinit var slInput: EditText
-    private lateinit var tpInput: EditText
-    private lateinit var watchlistText: TextView
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
+        .build()
 
-    private val pickImage = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
-        uri?.let {
-            contentResolver.openInputStream(it)?.use { stream ->
-                selectedBitmap = BitmapFactory.decodeStream(stream)
+    private val pickImageLauncher =
+        registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+            uri?.let {
+                try {
+                    contentResolver.openInputStream(it)?.use { stream ->
+                        selectedBitmap = BitmapFactory.decodeStream(stream)
+                        ivPreview.setImageBitmap(selectedBitmap)
+                        tvStatus.text = "Chart loaded. Tap '2. Scan Chart with AI'."
+                    }
+                } catch (e: Exception) {
+                    tvStatus.text = "Failed to load image: \${e.message}"
+                }
             }
-            previewImage.setImageBitmap(selectedBitmap)
-            statusText.text = "Chart loaded. Tap 'Scan Chart with AI'."
         }
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
-            }
-        }
+        etApiKey = findViewById(R.id.etApiKey)
+        btnPickImage = findViewById(R.id.btnPickImage)
+        btnScanChart = findViewById(R.id.btnScanChart)
+        ivPreview = findViewById(R.id.ivPreview)
+        rgDirection = findViewById(R.id.rgDirection)
+        rbBuy = findViewById(R.id.rbBuy)
+        rbSell = findViewById(R.id.rbSell)
+        etEntry = findViewById(R.id.etEntry)
+        etSl = findViewById(R.id.etSl)
+        etTp = findViewById(R.id.etTp)
+        spSymbol = findViewById(R.id.spSymbol)
+        btnStartWatcher = findViewById(R.id.btnStartWatcher)
+        btnStopWatcher = findViewById(R.id.btnStopWatcher)
+        tvStatus = findViewById(R.id.tvStatus)
+
+        requestNotificationPermissionIfNeeded()
 
         val prefs = getSharedPreferences("ticksniper_prefs", Context.MODE_PRIVATE)
-        prefs.edit().putFloat("price_offset", 0f).apply()
+        etApiKey.setText(prefs.getString("gemini_api_key", ""))
 
-        val scroll = ScrollView(this)
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(40, 40, 40, 40)
+        val symbols = listOf("GC=F", "BTC-USD")
+        spSymbol.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, symbols)
+        val savedSymbol = prefs.getString("symbol", "GC=F") ?: "GC=F"
+        val idx = symbols.indexOf(savedSymbol)
+        if (idx >= 0) spSymbol.setSelection(idx)
+
+        btnPickImage.setOnClickListener {
+            pickImageLauncher.launch("image/*")
         }
 
-        val title = TextView(this).apply {
-            text = "🎯 Pip Sniper 1m AI Watcher"
-            textSize = 22f
-            setPadding(0, 0, 0, 20)
-        }
-
-        symbolSpinner = Spinner(this).apply {
-            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, listOf("XAUUSD", "BTCUSD"))
-            setSelection(if (prefs.getString("ui_symbol", "XAUUSD") == "BTCUSD") 1 else 0)
-            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
-                    val uiSym = if (pos == 1) "BTCUSD" else "XAUUSD"
-                    val yahooSym = if (pos == 1) "BTC-USD" else "GC=F"
-                    val prevSym = prefs.getString("ui_symbol", "XAUUSD")
-                    if (prevSym != uiSym) {
-                        prefs.edit()
-                            .putString("ui_symbol", uiSym)
-                            .putString("symbol", yahooSym)
-                            .putString("last_price", "Fetching...")
-                            .apply()
-                    } else {
-                        prefs.edit().putString("symbol", yahooSym).apply()
-                    }
-                    refreshWatchlist()
-                }
-                override fun onNothingSelected(parent: AdapterView<*>?) {}
+        btnScanChart.setOnClickListener {
+            val apiKey = etApiKey.text.toString().trim()
+            if (apiKey.isEmpty()) {
+                tvStatus.text = "Enter your Gemini API Key first."
+                return@setOnClickListener
             }
-        }
-
-        apiKeyInput = EditText(this).apply {
-            hint = "Gemini API Key"
-            setText(prefs.getString("gemini_key", ""))
-        }
-
-        val saveKeyBtn = Button(this).apply {
-            text = "Save Settings & Start Background Watcher"
-            setOnClickListener {
-                prefs.edit()
-                    .putString("gemini_key", apiKeyInput.text.toString().trim())
-                    .putFloat("price_offset", 0f)
-                    .apply()
-                startWatcherService()
-                Toast.makeText(this@MainActivity, "Settings saved & watcher active!", Toast.LENGTH_SHORT).show()
+            val bmp = selectedBitmap
+            if (bmp == null) {
+                tvStatus.text = "Select a chart screenshot first."
+                return@setOnClickListener
             }
+            prefs.edit().putString("gemini_api_key", apiKey).apply()
+            scanChartWithGemini(apiKey, bmp)
         }
 
-        val uploadBtn = Button(this).apply {
-            text = "1. Pick Signal Screenshot from Gallery"
-            setOnClickListener { pickImage.launch("image/*") }
-        }
+        btnStartWatcher.setOnClickListener {
+            val entry = etEntry.text.toString().trim().toDoubleOrNull()
+            val sl = etSl.text.toString().trim().toDoubleOrNull()
+            val tp = etTp.text.toString().trim().toDoubleOrNull()
 
-        previewImage = ImageView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 450)
-            scaleType = ImageView.ScaleType.FIT_CENTER
-        }
-
-        val scanBtn = Button(this).apply {
-            text = "2. Scan Chart with AI"
-            setOnClickListener {
-                val bmp = selectedBitmap
-                val key = apiKeyInput.text.toString().trim()
-                if (bmp == null || key.isEmpty()) {
-                    Toast.makeText(this@MainActivity, "Enter API Key & pick a chart first!", Toast.LENGTH_SHORT).show()
-                    return@setOnClickListener
-                }
-                prefs.edit().putString("gemini_key", key).apply()
-                statusText.text = "Scanning Entry, SL & TP..."
-                scanChartWithGemini(bmp, key)
+            if (entry == null || sl == null || tp == null) {
+                tvStatus.text = "Enter valid Entry, SL, and TP numbers first."
+                return@setOnClickListener
             }
-        }
 
-        statusText = TextView(this).apply {
-            text = "Ready."
-            setPadding(0, 15, 0, 15)
-        }
+            val direction = if (rbSell.isChecked) "SELL" else "BUY"
+            val chosenSymbol = spSymbol.selectedItem?.toString() ?: "GC=F"
 
-        dirSpinner = Spinner(this).apply {
-            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, listOf("BUY", "SELL"))
-        }
-        entryInput = EditText(this).apply {
-            hint = "Entry Price"
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-        }
-        slInput = EditText(this).apply {
-            hint = "Stop Loss (SL)"
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-        }
-        tpInput = EditText(this).apply {
-            hint = "Take Profit (TP)"
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-        }
-
-        val trackBtn = Button(this).apply {
-            text = "3. Start 1m Confirmation Watcher"
-            setOnClickListener {
-                val dir = dirSpinner.selectedItem.toString()
-                val entry = entryInput.text.toString().toDoubleOrNull()
-                val sl = slInput.text.toString().toDoubleOrNull()
-                val tp = tpInput.text.toString().toDoubleOrNull()
-
-                if (entry == null || sl == null || tp == null) {
-                    Toast.makeText(this@MainActivity, "Verify valid numbers first!", Toast.LENGTH_SHORT).show()
-                    return@setOnClickListener
-                }
-                if (dir == "BUY" && (sl >= entry || tp <= entry)) {
-                    Toast.makeText(this@MainActivity, "Invalid BUY: SL must be below Entry and TP above!", Toast.LENGTH_LONG).show()
-                    return@setOnClickListener
-                }
-                if (dir == "SELL" && (sl <= entry || tp >= entry)) {
-                    Toast.makeText(this@MainActivity, "Invalid SELL: SL must be above Entry and TP below!", Toast.LENGTH_LONG).show()
-                    return@setOnClickListener
-                }
-
-                val arr = JSONArray(prefs.getString("setups", "[]") ?: "[]")
-                arr.put(JSONObject().apply {
-                    put("direction", dir)
-                    put("entry", entry)
-                    put("sl", sl)
-                    put("tp", tp)
-                    put("tapped", false)
-                    put("tap_ts", 0L)
-                })
-                prefs.edit().putString("setups", arr.toString()).apply()
-
-                startWatcherService()
-                refreshWatchlist()
-                Toast.makeText(this@MainActivity, "Armed! Alarm will fire on 1m closed confirmation.", Toast.LENGTH_LONG).show()
+            val setupObj = JSONObject().apply {
+                put("direction", direction)
+                put("entry", entry)
+                put("sl", sl)
+                put("tp", tp)
+                put("tapped", false)
+                put("tap_ts", 0L)
             }
+
+            val setupsArr = JSONArray().apply { put(setupObj) }
+            prefs.edit()
+                .putString("gemini_api_key", etApiKey.text.toString().trim())
+                .putString("symbol", chosenSymbol)
+                .putString("setups", setupsArr.toString())
+                .apply()
+
+            val serviceIntent = Intent(this, SniperWatcherService::class.java)
+            ContextCompat.startForegroundService(this, serviceIntent)
+            tvStatus.text = "Watcher Armed (\$chosenSymbol): $direction @ $entry | SL: $sl \vert{} TP:$tp"
         }
 
-        val clearBtn = Button(this).apply {
-            text = "Clear Active Watchlist"
-            setOnClickListener {
-                prefs.edit().putString("setups", "[]").apply()
-                refreshWatchlist()
-            }
-        }
-
-        watchlistText = TextView(this).apply {
-            textSize = 15f
-            setPadding(0, 25, 0, 25)
-        }
-
-        layout.addView(title)
-        layout.addView(symbolSpinner)
-        layout.addView(apiKeyInput)
-        layout.addView(saveKeyBtn)
-        layout.addView(uploadBtn)
-        layout.addView(previewImage)
-        layout.addView(scanBtn)
-        layout.addView(statusText)
-        layout.addView(dirSpinner)
-        layout.addView(entryInput)
-        layout.addView(slInput)
-        layout.addView(tpInput)
-        layout.addView(trackBtn)
-        layout.addView(watchlistText)
-        layout.addView(clearBtn)
-
-        scroll.addView(layout)
-        setContentView(scroll)
-        startWatcherService()
-
-        scope.launch {
-            while (isActive) {
-                refreshWatchlist()
-                delay(4000)
-            }
+        btnStopWatcher.setOnClickListener {
+            prefs.edit().putString("setups", "[]").apply()
+            stopService(Intent(this, SniperWatcherService::class.java))
+            tvStatus.text = "Watcher stopped and active setups cleared."
         }
     }
 
-    private fun startWatcherService() {
-        val intent = Intent(this, SniperWatcherService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
-    }
+    private fun scanChartWithGemini(apiKey: String, bitmap: Bitmap) {
+        btnScanChart.isEnabled = false
+        btnScanChart.text = "Scanning Chart..."
+        tvStatus.text = "Compressing chart & contacting AI..."
 
-    private fun refreshWatchlist() {
-        val prefs = getSharedPreferences("ticksniper_prefs", Context.MODE_PRIVATE)
-        val sym = prefs.getString("ui_symbol", "XAUUSD") ?: "XAUUSD"
-        val arr = JSONArray(prefs.getString("setups", "[]") ?: "[]")
-        val price = prefs.getString("last_price", "Waiting...")
-
-        val sb = StringBuilder("Live $sym: $$price\nActive Watchlist (${arr.length()}):\n\n")
-        for (i in 0 until arr.length()) {
-            val s = arr.getJSONObject(i)
-            val st = if (s.optBoolean("tapped")) "👀 Zone Tapped (Watching 1m Close)" else "⏳ Waiting for Zone Tap"
-            sb.append("#${i + 1} ${s.getString("direction")} @ ${s.getDouble("entry")} | SL: ${s.getDouble("sl")} | TP: ${s.getDouble("tp")}\n$st\n\n")
-        }
-        watchlistText.text = sb.toString()
-    }
-
-    private fun scanChartWithGemini(bmp: Bitmap, apiKey: String) {
-        scope.launch(Dispatchers.IO) {
+        lifecycleScope.launch(Dispatchers.IO) {
             try {
-                // Compress screenshot to 768px max width for fast, low-load API inference
-                val scaledBmp = if (bmp.width > 768) {
-                    val ratio = 768.0 / bmp.width
-                    Bitmap.createScaledBitmap(bmp, 768, (bmp.height * ratio).toInt(), true)
-                } else bmp
+                val maxDim = 800
+                val scale = minOf(maxDim.toFloat() / bitmap.width, maxDim.toFloat() / bitmap.height, 1f)
+                val scaled = if (scale < 1f) {
+                    Bitmap.createScaledBitmap(
+                        bitmap,
+                        (bitmap.width * scale).toInt(),
+                        (bitmap.height * scale).toInt(),
+                        true
+                    )
+                } else bitmap
 
-                val out = ByteArrayOutputStream()
-                scaledBmp.compress(Bitmap.CompressFormat.JPEG, 78, out)
-                val b64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+                val baos = ByteArrayOutputStream()
+                scaled.compress(Bitmap.CompressFormat.JPEG, 80, baos)
+                val base64Image = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
 
                 val prompt = """
-                    Analyze this TradingView/MT5 chart screenshot.
-                    If small Stop-Loss box is ABOVE large Take-Profit box -> SELL.
-                    If small Stop-Loss box is BELOW large Take-Profit box -> BUY.
-                    Return ONLY raw JSON with no markdown: {"direction":"BUY","entry":3702.24,"sl":3699.57,"tp":3721.01}
+                    Analyze this trading chart screenshot. Find the Buy or Sell position tool (green/red risk-reward box) or marked Entry, Stop Loss (SL), and Take Profit (TP) price levels on the right price axis.
+                    Reply ONLY with valid JSON and nothing else:
+                    {"direction":"BUY","entry":0.0,"sl":0.0,"tp":0.0}
                 """.trimIndent()
 
-                val genPayload = JSONObject().apply {
-                    put("contents", JSONArray().put(JSONObject().apply {
-                        put("parts", JSONArray()
-                            .put(JSONObject().put("text", prompt))
-                            .put(JSONObject().put("inline_data", JSONObject().apply {
-                                put("mime_type", "image/jpeg")
-                                put("data", b64)
-                            }))
-                        )
-                    }))
-                    put("generationConfig", JSONObject().apply {
-                        put("temperature", 0.0)
-                        put("maxOutputTokens", 256)
-                        put("thinkingConfig", JSONObject().apply {
-                            put("thinkingLevel", "minimal")
+                val requestJson = JSONObject().apply {
+                    put("contents", JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("parts", JSONArray().apply {
+                                put(JSONObject().put("text", prompt))
+                                put(JSONObject().apply {
+                                    put("inline_data", JSONObject().apply {
+                                        put("mime_type", "image/jpeg")
+                                        put("data", base64Image)
+                                    })
+                                })
+                            })
                         })
+                    })
+                    put("generationConfig", JSONObject().apply {
+                        put("temperature", 0.1)
+                        put("responseMimeType", "application/json")
                     })
                 }
 
-                // Rotate across Flash & Flash-Lite models with retry backoff on high-demand spikes
-                val attempts = listOf(
-                    "gemini-3.8-flash",
-                    "gemini-3.8-flash-lite",
-                    "gemini-3.0-flash",
-                    "gemini-2.5-flash-lite",
+                val models = listOf(
+                    "gemini-3.6-flash",
+                    "gemini-3.1-flash-lite",
                     "gemini-3.8-flash"
                 )
 
-                var lastError = "Unknown Gemini Error"
-                var successText: String? = null
+                var parsedResult: JSONObject? = null
+                var lastError = "Unknown error"
 
-                for ((index, model) in attempts.withIndex()) {
+                for (model in models) {
                     withContext(Dispatchers.Main) {
-                        statusText.text = "Scanning with $model (attempt ${index + 1}/${attempts.size})..."
+                        tvStatus.text = "Trying \$model..."
                     }
 
                     val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
-                    val req = Request.Builder()
+                    val request = Request.Builder()
                         .url(url)
-                        .post(genPayload.toString().toRequestBody("application/json".toMediaType()))
+                        .post(requestJson.toString().toRequestBody("application/json".toMediaType()))
                         .build()
 
-                    client.newCall(req).execute().use { resp ->
-                        val resStr = resp.body?.string() ?: ""
-                        val rootJson = JSONObject(resStr)
-                        if (rootJson.has("error")) {
-                            lastError = "[$model] " + rootJson.getJSONObject("error").optString("message", resStr)
-                            return@use
-                        }
-                        val parts = rootJson
-                            .getJSONArray("candidates").getJSONObject(0)
-                            .getJSONObject("content").getJSONArray("parts")
-                        for (i in 0 until parts.length()) {
-                            val p = parts.getJSONObject(i)
-                            if (p.has("text") && !p.optBoolean("thought", false)) {
-                                successText = extractJsonBlock(p.getString("text"))
-                                break
+                    try {
+                        httpClient.newCall(request).execute().use { response ->
+                            val bodyStr = response.body?.string() ?: ""
+                            if (response.isSuccessful) {
+                                val root = JSONObject(bodyStr)
+                                val rawText = root.getJSONArray("candidates")
+                                    .getJSONObject(0)
+                                    .getJSONObject("content")
+                                    .getJSONArray("parts")
+                                    .getJSONObject(0)
+                                    .getString("text")
+                                    .trim()
+
+                                val cleanJson = rawText
+                                    .removePrefix("```json")
+                                    .removePrefix("```")
+                                    .removeSuffix("```")
+                                    .trim()
+
+                                parsedResult = JSONObject(cleanJson)
+                            } else {
+                                val errMsg = try {
+                                    JSONObject(bodyStr).getJSONObject("error").getString("message")
+                                } catch (_: Exception) {
+                                    "HTTP ${response.code}"
+                                }
+                                lastError = "$model -> $errMsg"
                             }
                         }
+                    } catch (e: Exception) {
+                        lastError = "$model -> ${e.message}"
                     }
 
-                    if (successText != null) break
-                    delay(2000)
+                    if (parsedResult != null) break
+                    delay(800)
                 }
 
-                if (successText == null) throw Exception(lastError)
-
-                val parsed = JSONObject(successText!!)
                 withContext(Dispatchers.Main) {
-                    dirSpinner.setSelection(if (parsed.getString("direction").uppercase(Locale.US) == "BUY") 0 else 1)
-                    entryInput.setText(parsed.getDouble("entry").toString())
-                    slInput.setText(parsed.getDouble("sl").toString())
-                    tpInput.setText(parsed.getDouble("tp").toString())
-                    statusText.text = "✅ Levels extracted! Verify & tap Start Watcher."
+                    btnScanChart.isEnabled = true
+                    btnScanChart.text = "2. Scan Chart with AI"
+
+                    if (parsedResult != null) {
+                        val dir = parsedResult!!.optString("direction", "BUY").uppercase()
+                        val entry = parsedResult!!.optDouble("entry", 0.0)
+                        val sl = parsedResult!!.optDouble("sl", 0.0)
+                        val tp = parsedResult!!.optDouble("tp", 0.0)
+
+                        if (dir == "SELL") rbSell.isChecked = true else rbBuy.isChecked = true
+                        if (entry > 0) etEntry.setText(entry.toString())
+                        if (sl > 0) etSl.setText(sl.toString())
+                        if (tp > 0) etTp.setText(tp.toString())
+
+                        tvStatus.text = "AI Extracted: $dir | Entry: $entry | SL: $sl | TP: $tp"
+                    } else {
+                        tvStatus.text = "Scan Failed: $lastError"
+                    }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    statusText.text = "Scan error: ${e.message}"
+                    btnScanChart.isEnabled = true
+                    btnScanChart.text = "2. Scan Chart with AI"
+                    tvStatus.text = "App Error: ${e.message}"
                 }
             }
         }
     }
 
-    private fun extractJsonBlock(raw: String): String {
-        val cleaned = raw.replace("```json", "").replace("```", "").trim()
-        val start = cleaned.indexOf('{')
-        val end = cleaned.lastIndexOf('}')
-        return if (start != -1 && end > start) cleaned.substring(start, end + 1) else cleaned
-    }
-
-    override fun onDestroy() {
-        scope.cancel()
-        super.onDestroy()
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                    1001
+                )
+            }
+        }
     }
 }
