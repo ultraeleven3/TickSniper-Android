@@ -27,20 +27,18 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.util.Locale
 import java.util.concurrent.TimeUnit
-import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
     private var selectedBitmap: Bitmap? = null
 
     private lateinit var symbolSpinner: Spinner
-    private lateinit var offsetInput: EditText
     private lateinit var apiKeyInput: EditText
     private lateinit var previewImage: ImageView
     private lateinit var statusText: TextView
@@ -70,6 +68,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         val prefs = getSharedPreferences("ticksniper_prefs", Context.MODE_PRIVATE)
+        prefs.edit().putFloat("price_offset", 0f).apply()
+
         val scroll = ScrollView(this)
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -105,13 +105,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        offsetInput = EditText(this).apply {
-            hint = "Broker Offset (e.g. -22.50 if GC=F > Spot)"
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or InputType.TYPE_NUMBER_FLAG_SIGNED
-            val savedOffset = prefs.getFloat("price_offset", 0f)
-            if (savedOffset != 0f) setText(savedOffset.toString())
-        }
-
         apiKeyInput = EditText(this).apply {
             hint = "Gemini API Key"
             setText(prefs.getString("gemini_key", ""))
@@ -120,10 +113,9 @@ class MainActivity : AppCompatActivity() {
         val saveKeyBtn = Button(this).apply {
             text = "Save Settings & Start Background Watcher"
             setOnClickListener {
-                val offsetVal = offsetInput.text.toString().trim().toFloatOrNull() ?: 0f
                 prefs.edit()
                     .putString("gemini_key", apiKeyInput.text.toString().trim())
-                    .putFloat("price_offset", offsetVal)
+                    .putFloat("price_offset", 0f)
                     .apply()
                 startWatcherService()
                 Toast.makeText(this@MainActivity, "Settings saved & watcher active!", Toast.LENGTH_SHORT).show()
@@ -197,7 +189,6 @@ class MainActivity : AppCompatActivity() {
                     return@setOnClickListener
                 }
 
-                val offsetVal = offsetInput.text.toString().trim().toFloatOrNull() ?: 0f
                 val arr = JSONArray(prefs.getString("setups", "[]") ?: "[]")
                 arr.put(JSONObject().apply {
                     put("direction", dir)
@@ -207,10 +198,7 @@ class MainActivity : AppCompatActivity() {
                     put("tapped", false)
                     put("tap_ts", 0L)
                 })
-                prefs.edit()
-                    .putFloat("price_offset", offsetVal)
-                    .putString("setups", arr.toString())
-                    .apply()
+                prefs.edit().putString("setups", arr.toString()).apply()
 
                 startWatcherService()
                 refreshWatchlist()
@@ -233,7 +221,6 @@ class MainActivity : AppCompatActivity() {
 
         layout.addView(title)
         layout.addView(symbolSpinner)
-        layout.addView(offsetInput)
         layout.addView(apiKeyInput)
         layout.addView(saveKeyBtn)
         layout.addView(uploadBtn)
@@ -274,10 +261,8 @@ class MainActivity : AppCompatActivity() {
         val sym = prefs.getString("ui_symbol", "XAUUSD") ?: "XAUUSD"
         val arr = JSONArray(prefs.getString("setups", "[]") ?: "[]")
         val price = prefs.getString("last_price", "Waiting...")
-        val offset = prefs.getFloat("price_offset", 0f)
-        val offsetTag = if (offset != 0f) " (Offset: $offset)" else ""
 
-        val sb = StringBuilder("Live $sym$offsetTag: $$price\nActive Watchlist (${arr.length()}):\n\n")
+        val sb = StringBuilder("Live $sym: $$price\nActive Watchlist (${arr.length()}):\n\n")
         for (i in 0 until arr.length()) {
             val s = arr.getJSONObject(i)
             val st = if (s.optBoolean("tapped")) "👀 Zone Tapped (Watching 1m Close)" else "⏳ Waiting for Zone Tap"
@@ -297,31 +282,34 @@ class MainActivity : AppCompatActivity() {
                     Analyze this TradingView/MT5 chart screenshot.
                     If small Stop-Loss box is ABOVE large Take-Profit box -> SELL.
                     If small Stop-Loss box is BELOW large Take-Profit box -> BUY.
-                    Also read the current live market price highlighted on the right axis as "chart_price".
-                    Return ONLY JSON: {"direction":"BUY","entry":3702.24,"sl":3699.57,"tp":3721.01,"chart_price":3704.10}
+                    Return ONLY raw JSON with no markdown: {"direction":"BUY","entry":3702.24,"sl":3699.57,"tp":3721.01}
                 """.trimIndent()
-
-                val payload = JSONObject().apply {
-                    put("contents", JSONArray().put(JSONObject().apply {
-                        put("parts", JSONArray()
-                            .put(JSONObject().put("text", prompt))
-                            .put(JSONObject().put("inline_data", JSONObject().apply {
-                                put("mime_type", "image/jpeg")
-                                put("data", b64)
-                            }))
-                        )
-                    }))
-                }
 
                 val models = listOf("gemini-3.8-flash", "gemini-3.0-flash", "gemini-2.5-flash")
                 var lastError = "Unknown Gemini Error"
                 var successText: String? = null
 
+                // 1. Try Interactions API first (supports AQ.* keys and gemini-3.8-flash / 3.0-flash)
                 for (model in models) {
-                    val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+                    val interactionsPayload = JSONObject().apply {
+                        put("model", model)
+                        put("input", JSONArray()
+                            .put(JSONObject().apply {
+                                put("type", "text")
+                                put("text", prompt)
+                            })
+                            .put(JSONObject().apply {
+                                put("type", "image")
+                                put("data", b64)
+                                put("mime_type", "image/jpeg")
+                            })
+                        )
+                    }
+
                     val req = Request.Builder()
-                        .url(url)
-                        .post(payload.toString().toRequestBody("application/json".toMediaType()))
+                        .url("https://generativelanguage.googleapis.com/v1beta/interactions")
+                        .header("x-goog-api-key", apiKey)
+                        .post(interactionsPayload.toString().toRequestBody("application/json".toMediaType()))
                         .build()
 
                     client.newCall(req).execute().use { resp ->
@@ -329,38 +317,69 @@ class MainActivity : AppCompatActivity() {
                         val rootJson = JSONObject(resStr)
                         if (rootJson.has("error")) {
                             lastError = rootJson.getJSONObject("error").optString("message", lastError)
-                            delay(800)
                             return@use
                         }
-
-                        successText = rootJson
-                            .getJSONArray("candidates").getJSONObject(0)
-                            .getJSONObject("content").getJSONArray("parts").getJSONObject(0)
-                            .getString("text")
-                            .replace("```json", "").replace("```", "").trim()
+                        val outputs = rootJson.optJSONArray("outputs")
+                        if (outputs != null) {
+                            for (i in 0 until outputs.length()) {
+                                val item = outputs.getJSONObject(i)
+                                if (item.optString("type") == "text") {
+                                    successText = extractJsonBlock(item.getString("text"))
+                                    break
+                                }
+                            }
+                        }
                     }
                     if (successText != null) break
+                }
+
+                // 2. Fallback to standard generateContent endpoint
+                if (successText == null) {
+                    val genPayload = JSONObject().apply {
+                        put("contents", JSONArray().put(JSONObject().apply {
+                            put("parts", JSONArray()
+                                .put(JSONObject().put("text", prompt))
+                                .put(JSONObject().put("inline_data", JSONObject().apply {
+                                    put("mime_type", "image/jpeg")
+                                    put("data", b64)
+                                }))
+                            )
+                        }))
+                    }
+
+                    for (model in models) {
+                        val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+                        val req = Request.Builder()
+                            .url(url)
+                            .post(genPayload.toString().toRequestBody("application/json".toMediaType()))
+                            .build()
+
+                        client.newCall(req).execute().use { resp ->
+                            val resStr = resp.body?.string() ?: ""
+                            val rootJson = JSONObject(resStr)
+                            if (rootJson.has("error")) {
+                                lastError = rootJson.getJSONObject("error").optString("message", lastError)
+                                return@use
+                            }
+                            val raw = rootJson
+                                .getJSONArray("candidates").getJSONObject(0)
+                                .getJSONObject("content").getJSONArray("parts").getJSONObject(0)
+                                .getString("text")
+                            successText = extractJsonBlock(raw)
+                        }
+                        if (successText != null) break
+                    }
                 }
 
                 if (successText == null) throw Exception(lastError)
 
                 val parsed = JSONObject(successText!!)
-                val chartPrice = parsed.optDouble("chart_price", 0.0)
-                val prefs = getSharedPreferences("ticksniper_prefs", Context.MODE_PRIVATE)
-                val liveFeedPrice = prefs.getString("last_price", "")?.toDoubleOrNull() ?: 0.0
-
                 withContext(Dispatchers.Main) {
                     dirSpinner.setSelection(if (parsed.getString("direction").uppercase(Locale.US) == "BUY") 0 else 1)
                     entryInput.setText(parsed.getDouble("entry").toString())
                     slInput.setText(parsed.getDouble("sl").toString())
                     tpInput.setText(parsed.getDouble("tp").toString())
-
-                    if (chartPrice > 0.0 && liveFeedPrice > 0.0 && abs(chartPrice - liveFeedPrice) > 3.0) {
-                        val suggestedOffset = String.format(Locale.US, "%.2f", chartPrice - liveFeedPrice)
-                        statusText.text = "⚠️ Chart ($chartPrice) vs Feed ($liveFeedPrice) differ! Set Broker Offset to $suggestedOffset."
-                    } else {
-                        statusText.text = "✅ Levels extracted! Verify & tap Start Watcher."
-                    }
+                    statusText.text = "✅ Levels extracted! Verify & tap Start Watcher."
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -368,6 +387,13 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    private fun extractJsonBlock(raw: String): String {
+        val cleaned = raw.replace("```json", "").replace("```", "").trim()
+        val start = cleaned.indexOf('{')
+        val end = cleaned.lastIndexOf('}')
+        return if (start != -1 && end > start) cleaned.substring(start, end + 1) else cleaned
     }
 
     override fun onDestroy() {
