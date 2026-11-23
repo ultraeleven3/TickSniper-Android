@@ -274,13 +274,14 @@ class MainActivity : AppCompatActivity() {
     private fun scanChartWithGemini(bmp: Bitmap, apiKey: String) {
         scope.launch(Dispatchers.IO) {
             try {
-                val scaledBmp = if (bmp.width > 1280) {
-                    val ratio = 1280.0 / bmp.width
-                    Bitmap.createScaledBitmap(bmp, 1280, (bmp.height * ratio).toInt(), true)
+                // Compress screenshot to 768px max width for fast, low-load API inference
+                val scaledBmp = if (bmp.width > 768) {
+                    val ratio = 768.0 / bmp.width
+                    Bitmap.createScaledBitmap(bmp, 768, (bmp.height * ratio).toInt(), true)
                 } else bmp
 
                 val out = ByteArrayOutputStream()
-                scaledBmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                scaledBmp.compress(Bitmap.CompressFormat.JPEG, 78, out)
                 val b64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
 
                 val prompt = """
@@ -290,11 +291,6 @@ class MainActivity : AppCompatActivity() {
                     Return ONLY raw JSON with no markdown: {"direction":"BUY","entry":3702.24,"sl":3699.57,"tp":3721.01}
                 """.trimIndent()
 
-               val models = listOf("gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.8-flash")
-                var primaryError: String? = null
-                var successText: String? = null
-
-                // 1. Standard generateContent endpoint (officially supported on gemini-3.8-flash)
                 val genPayload = JSONObject().apply {
                     put("contents", JSONArray().put(JSONObject().apply {
                         put("parts", JSONArray()
@@ -305,9 +301,32 @@ class MainActivity : AppCompatActivity() {
                             }))
                         )
                     }))
+                    put("generationConfig", JSONObject().apply {
+                        put("temperature", 0.0)
+                        put("maxOutputTokens", 256)
+                        put("thinkingConfig", JSONObject().apply {
+                            put("thinkingLevel", "minimal")
+                        })
+                    })
                 }
 
-                for (model in models) {
+                // Rotate across Flash & Flash-Lite models with retry backoff on high-demand spikes
+                val attempts = listOf(
+                    "gemini-3.8-flash",
+                    "gemini-3.8-flash-lite",
+                    "gemini-3.0-flash",
+                    "gemini-2.5-flash-lite",
+                    "gemini-3.8-flash"
+                )
+
+                var lastError = "Unknown Gemini Error"
+                var successText: String? = null
+
+                for ((index, model) in attempts.withIndex()) {
+                    withContext(Dispatchers.Main) {
+                        statusText.text = "Scanning with $model (attempt ${index + 1}/${attempts.size})..."
+                    }
+
                     val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
                     val req = Request.Builder()
                         .url(url)
@@ -318,9 +337,7 @@ class MainActivity : AppCompatActivity() {
                         val resStr = resp.body?.string() ?: ""
                         val rootJson = JSONObject(resStr)
                         if (rootJson.has("error")) {
-                            if (primaryError == null) {
-                                primaryError = "[$model] " + rootJson.getJSONObject("error").optString("message", resStr)
-                            }
+                            lastError = "[$model] " + rootJson.getJSONObject("error").optString("message", resStr)
                             return@use
                         }
                         val parts = rootJson
@@ -334,58 +351,12 @@ class MainActivity : AppCompatActivity() {
                             }
                         }
                     }
+
                     if (successText != null) break
+                    delay(2000)
                 }
 
-                // 2. Fallback to Interactions API (/v1beta/interactions)
-                if (successText == null) {
-                    for (model in models) {
-                        val interactionsPayload = JSONObject().apply {
-                            put("model", model)
-                            put("input", JSONArray()
-                                .put(JSONObject().apply {
-                                    put("type", "text")
-                                    put("text", prompt)
-                                })
-                                .put(JSONObject().apply {
-                                    put("type", "image")
-                                    put("data", b64)
-                                    put("mime_type", "image/jpeg")
-                                })
-                            )
-                        }
-
-                        val req = Request.Builder()
-                            .url("https://generativelanguage.googleapis.com/v1beta/interactions")
-                            .header("x-goog-api-key", apiKey)
-                            .post(interactionsPayload.toString().toRequestBody("application/json".toMediaType()))
-                            .build()
-
-                        client.newCall(req).execute().use { resp ->
-                            val resStr = resp.body?.string() ?: ""
-                            val rootJson = JSONObject(resStr)
-                            if (rootJson.has("error")) {
-                                if (primaryError == null) {
-                                    primaryError = "[$model interactions] " + rootJson.getJSONObject("error").optString("message", resStr)
-                                }
-                                return@use
-                            }
-                            val outputs = rootJson.optJSONArray("outputs")
-                            if (outputs != null) {
-                                for (i in 0 until outputs.length()) {
-                                    val item = outputs.getJSONObject(i)
-                                    if (item.optString("type") == "text") {
-                                        successText = extractJsonBlock(item.getString("text"))
-                                        break
-                                    }
-                                }
-                            }
-                        }
-                        if (successText != null) break
-                    }
-                }
-
-                if (successText == null) throw Exception(primaryError ?: "Empty response from Gemini")
+                if (successText == null) throw Exception(lastError)
 
                 val parsed = JSONObject(successText!!)
                 withContext(Dispatchers.Main) {
