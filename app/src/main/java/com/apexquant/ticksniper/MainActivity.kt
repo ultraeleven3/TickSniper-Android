@@ -9,6 +9,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.text.InputType
 import android.util.Base64
 import android.view.View
 import android.widget.*
@@ -24,14 +25,22 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.util.Locale
+import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    private val client = OkHttpClient()
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
+        .build()
+
     private var selectedBitmap: Bitmap? = null
 
     private lateinit var symbolSpinner: Spinner
+    private lateinit var offsetInput: EditText
     private lateinit var apiKeyInput: EditText
     private lateinit var previewImage: ImageView
     private lateinit var statusText: TextView
@@ -43,8 +52,9 @@ class MainActivity : AppCompatActivity() {
 
     private val pickImage = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri?.let {
-            val stream = contentResolver.openInputStream(it)
-            selectedBitmap = BitmapFactory.decodeStream(stream)
+            contentResolver.openInputStream(it)?.use { stream ->
+                selectedBitmap = BitmapFactory.decodeStream(stream)
+            }
             previewImage.setImageBitmap(selectedBitmap)
             statusText.text = "Chart loaded. Tap 'Scan Chart with AI'."
         }
@@ -67,22 +77,39 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "📈 TickSniper 1m AI Watcher"
+            text = "🎯 Pip Sniper 1m AI Watcher"
             textSize = 22f
             setPadding(0, 0, 0, 20)
         }
 
         symbolSpinner = Spinner(this).apply {
             adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, listOf("XAUUSD", "BTCUSD"))
-            setSelection(if (prefs.getString("symbol", "XAUUSD") == "BTCUSD") 1 else 0)
+            setSelection(if (prefs.getString("ui_symbol", "XAUUSD") == "BTCUSD") 1 else 0)
             onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                 override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
-                    val sym = if (pos == 1) "BTCUSD" else "XAUUSD"
-                    prefs.edit().putString("symbol", sym).putString("last_price", "Fetching...").apply()
+                    val uiSym = if (pos == 1) "BTCUSD" else "XAUUSD"
+                    val yahooSym = if (pos == 1) "BTC-USD" else "GC=F"
+                    val prevSym = prefs.getString("ui_symbol", "XAUUSD")
+                    if (prevSym != uiSym) {
+                        prefs.edit()
+                            .putString("ui_symbol", uiSym)
+                            .putString("symbol", yahooSym)
+                            .putString("last_price", "Fetching...")
+                            .apply()
+                    } else {
+                        prefs.edit().putString("symbol", yahooSym).apply()
+                    }
                     refreshWatchlist()
                 }
                 override fun onNothingSelected(parent: AdapterView<*>?) {}
             }
+        }
+
+        offsetInput = EditText(this).apply {
+            hint = "Broker Offset (e.g. -22.50 if GC=F > Spot)"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or InputType.TYPE_NUMBER_FLAG_SIGNED
+            val savedOffset = prefs.getFloat("price_offset", 0f)
+            if (savedOffset != 0f) setText(savedOffset.toString())
         }
 
         apiKeyInput = EditText(this).apply {
@@ -91,11 +118,15 @@ class MainActivity : AppCompatActivity() {
         }
 
         val saveKeyBtn = Button(this).apply {
-            text = "Save API Key & Start Background Watcher"
+            text = "Save Settings & Start Background Watcher"
             setOnClickListener {
-                prefs.edit().putString("gemini_key", apiKeyInput.text.toString().trim()).apply()
+                val offsetVal = offsetInput.text.toString().trim().toFloatOrNull() ?: 0f
+                prefs.edit()
+                    .putString("gemini_key", apiKeyInput.text.toString().trim())
+                    .putFloat("price_offset", offsetVal)
+                    .apply()
                 startWatcherService()
-                Toast.makeText(this@MainActivity, "Watcher running in background!", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "Settings saved & watcher active!", Toast.LENGTH_SHORT).show()
             }
         }
 
@@ -118,6 +149,7 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this@MainActivity, "Enter API Key & pick a chart first!", Toast.LENGTH_SHORT).show()
                     return@setOnClickListener
                 }
+                prefs.edit().putString("gemini_key", key).apply()
                 statusText.text = "Scanning Entry, SL & TP..."
                 scanChartWithGemini(bmp, key)
             }
@@ -131,32 +163,58 @@ class MainActivity : AppCompatActivity() {
         dirSpinner = Spinner(this).apply {
             adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, listOf("BUY", "SELL"))
         }
-        entryInput = EditText(this).apply { hint = "Entry Price" }
-        slInput = EditText(this).apply { hint = "Stop Loss (SL)" }
-        tpInput = EditText(this).apply { hint = "Take Profit (TP)" }
+        entryInput = EditText(this).apply {
+            hint = "Entry Price"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+        }
+        slInput = EditText(this).apply {
+            hint = "Stop Loss (SL)"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+        }
+        tpInput = EditText(this).apply {
+            hint = "Take Profit (TP)"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+        }
 
         val trackBtn = Button(this).apply {
             text = "3. Start 1m Confirmation Watcher"
             setOnClickListener {
+                val dir = dirSpinner.selectedItem.toString()
                 val entry = entryInput.text.toString().toDoubleOrNull()
                 val sl = slInput.text.toString().toDoubleOrNull()
                 val tp = tpInput.text.toString().toDoubleOrNull()
+
                 if (entry == null || sl == null || tp == null) {
                     Toast.makeText(this@MainActivity, "Verify valid numbers first!", Toast.LENGTH_SHORT).show()
                     return@setOnClickListener
                 }
-                val arr = JSONArray(prefs.getString("setups", "[]"))
+                if (dir == "BUY" && (sl >= entry || tp <= entry)) {
+                    Toast.makeText(this@MainActivity, "Invalid BUY: SL must be below Entry and TP above!", Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
+                if (dir == "SELL" && (sl <= entry || tp >= entry)) {
+                    Toast.makeText(this@MainActivity, "Invalid SELL: SL must be above Entry and TP below!", Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
+
+                val offsetVal = offsetInput.text.toString().trim().toFloatOrNull() ?: 0f
+                val arr = JSONArray(prefs.getString("setups", "[]") ?: "[]")
                 arr.put(JSONObject().apply {
-                    put("direction", dirSpinner.selectedItem.toString())
+                    put("direction", dir)
                     put("entry", entry)
                     put("sl", sl)
                     put("tp", tp)
                     put("tapped", false)
+                    put("tap_ts", 0L)
                 })
-                prefs.edit().putString("setups", arr.toString()).apply()
+                prefs.edit()
+                    .putFloat("price_offset", offsetVal)
+                    .putString("setups", arr.toString())
+                    .apply()
+
                 startWatcherService()
                 refreshWatchlist()
-                Toast.makeText(this@MainActivity, "Added! Your phone will alarm on 1m confirmation.", Toast.LENGTH_LONG).show()
+                Toast.makeText(this@MainActivity, "Armed! Alarm will fire on 1m closed confirmation.", Toast.LENGTH_LONG).show()
             }
         }
 
@@ -175,6 +233,7 @@ class MainActivity : AppCompatActivity() {
 
         layout.addView(title)
         layout.addView(symbolSpinner)
+        layout.addView(offsetInput)
         layout.addView(apiKeyInput)
         layout.addView(saveKeyBtn)
         layout.addView(uploadBtn)
@@ -212,10 +271,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshWatchlist() {
         val prefs = getSharedPreferences("ticksniper_prefs", Context.MODE_PRIVATE)
-        val sym = prefs.getString("symbol", "XAUUSD") ?: "XAUUSD"
-        val arr = JSONArray(prefs.getString("setups", "[]"))
+        val sym = prefs.getString("ui_symbol", "XAUUSD") ?: "XAUUSD"
+        val arr = JSONArray(prefs.getString("setups", "[]") ?: "[]")
         val price = prefs.getString("last_price", "Waiting...")
-        val sb = StringBuilder("Live $sym: $$price\nActive Watchlist (${arr.length()}):\n\n")
+        val offset = prefs.getFloat("price_offset", 0f)
+        val offsetTag = if (offset != 0f) " (Offset: $offset)" else ""
+
+        val sb = StringBuilder("Live $sym$offsetTag: $$price\nActive Watchlist (${arr.length()}):\n\n")
         for (i in 0 until arr.length()) {
             val s = arr.getJSONObject(i)
             val st = if (s.optBoolean("tapped")) "👀 Zone Tapped (Watching 1m Close)" else "⏳ Waiting for Zone Tap"
@@ -232,10 +294,11 @@ class MainActivity : AppCompatActivity() {
                 val b64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
 
                 val prompt = """
-                    Analyze this TradingView chart screenshot.
+                    Analyze this TradingView/MT5 chart screenshot.
                     If small Stop-Loss box is ABOVE large Take-Profit box -> SELL.
                     If small Stop-Loss box is BELOW large Take-Profit box -> BUY.
-                    Return ONLY JSON: {"direction":"BUY","entry":3702.24,"sl":3699.57,"tp":3721.01}
+                    Also read the current live market price highlighted on the right axis as "chart_price".
+                    Return ONLY JSON: {"direction":"BUY","entry":3702.24,"sl":3699.57,"tp":3721.01,"chart_price":3704.10}
                 """.trimIndent()
 
                 val payload = JSONObject().apply {
@@ -261,31 +324,43 @@ class MainActivity : AppCompatActivity() {
                         .post(payload.toString().toRequestBody("application/json".toMediaType()))
                         .build()
 
-                    val resStr = client.newCall(req).execute().body?.string() ?: ""
-                    val rootJson = JSONObject(resStr)
-                    if (rootJson.has("error")) {
-                        lastError = rootJson.getJSONObject("error").optString("message", lastError)
-                        delay(1000)
-                        continue
-                    }
+                    client.newCall(req).execute().use { resp ->
+                        val resStr = resp.body?.string() ?: ""
+                        val rootJson = JSONObject(resStr)
+                        if (rootJson.has("error")) {
+                            lastError = rootJson.getJSONObject("error").optString("message", lastError)
+                            delay(800)
+                            return@use
+                        }
 
-                    successText = rootJson
-                        .getJSONArray("candidates").getJSONObject(0)
-                        .getJSONObject("content").getJSONArray("parts").getJSONObject(0)
-                        .getString("text")
-                        .replace("```json", "").replace("```", "").trim()
-                    break
+                        successText = rootJson
+                            .getJSONArray("candidates").getJSONObject(0)
+                            .getJSONObject("content").getJSONArray("parts").getJSONObject(0)
+                            .getString("text")
+                            .replace("```json", "").replace("```", "").trim()
+                    }
+                    if (successText != null) break
                 }
 
                 if (successText == null) throw Exception(lastError)
 
-                val parsed = JSONObject(successText)
+                val parsed = JSONObject(successText!!)
+                val chartPrice = parsed.optDouble("chart_price", 0.0)
+                val prefs = getSharedPreferences("ticksniper_prefs", Context.MODE_PRIVATE)
+                val liveFeedPrice = prefs.getString("last_price", "")?.toDoubleOrNull() ?: 0.0
+
                 withContext(Dispatchers.Main) {
-                    dirSpinner.setSelection(if (parsed.getString("direction").uppercase() == "BUY") 0 else 1)
+                    dirSpinner.setSelection(if (parsed.getString("direction").uppercase(Locale.US) == "BUY") 0 else 1)
                     entryInput.setText(parsed.getDouble("entry").toString())
                     slInput.setText(parsed.getDouble("sl").toString())
                     tpInput.setText(parsed.getDouble("tp").toString())
-                    statusText.text = "✅ Levels extracted! Verify & tap Start Watcher."
+
+                    if (chartPrice > 0.0 && liveFeedPrice > 0.0 && abs(chartPrice - liveFeedPrice) > 3.0) {
+                        val suggestedOffset = String.format(Locale.US, "%.2f", chartPrice - liveFeedPrice)
+                        statusText.text = "⚠️ Chart ($chartPrice) vs Feed ($liveFeedPrice) differ! Set Broker Offset to $suggestedOffset."
+                    } else {
+                        statusText.text = "✅ Levels extracted! Verify & tap Start Watcher."
+                    }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -293,5 +368,10 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    override fun onDestroy() {
+        scope.cancel()
+        super.onDestroy()
     }
 }
